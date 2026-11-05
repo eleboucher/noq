@@ -457,6 +457,8 @@ pub struct Bbr3 {
     /// equivalent to BBR.full_bw_reached: A boolean that records whether BBR estimates that it has
     /// ever fully utilized its available bandwidth over the lifetime of the connection.
     full_bw_reached: bool,
+    /// Whether the initial pacing rate has been updated using a measured RTT.
+    has_seen_rtt: bool,
     /// equivalent to BBR.full_bw_now: A boolean that records whether BBR estimates that it has
     /// fully utilized its available bandwidth since it most recetly started looking.
     full_bw_now: bool,
@@ -658,6 +660,7 @@ impl Bbr3 {
             extra_acked_delivered: 0,
             extra_acked_filter: MaxFilter::new(EXTRA_ACKED_FILTER_LEN as u64),
             full_bw_reached: false,
+            has_seen_rtt: false,
             full_bw_now: false,
             full_bw: 0.0,
             full_bw_count: 0,
@@ -1662,6 +1665,13 @@ impl Bbr3 {
         _app_limited: bool,
         rtt: &RttEstimator,
     ) {
+        if !self.has_seen_rtt && rtt.has_sample() {
+            self.has_seen_rtt = true;
+            let srtt = rtt.get().as_secs_f64().max(0.001);
+            let nominal_bandwidth = self.initial_cwnd as f64 / srtt;
+            self.pacing_rate = self.startup_pacing_gain * nominal_bandwidth;
+            self.set_send_quantum();
+        }
         self.check_recovery_done(sent);
         self.delivered += bytes;
         self.delivered_time = Some(now);
@@ -1740,7 +1750,8 @@ impl Bbr3 {
         if largest_packet_num_acked.is_some() {
             if self.app_limited != 0 && self.delivered > self.app_limited {
                 self.app_limited = 0;
-            } else if app_limited {
+            }
+            if app_limited {
                 self.app_limited = Ord::max(self.delivered + self.inflight, 1);
             }
             let round_count = self.round_count;
@@ -2232,6 +2243,33 @@ mod test {
         assert_eq!(bbr3.rounds_since_bw_probe, 0);
         assert_eq!(bbr3.bw_probe_wait, Duration::from_millis(2461));
         assert_eq!(bbr3.reno_rounds_bound, 63);
+    }
+
+    #[test]
+    fn initial_pacing_rate_follows_first_rtt_sample() {
+        let config = Bbr3Config {
+            initial_window: 12_000,
+            ..Bbr3Config::default()
+        };
+        let mut bbr3 = Bbr3::new(Arc::new(config), 1200);
+        let placeholder = STARTUP_PACING_GAIN * 12_000.0 / 0.001;
+        assert!((bbr3.pacing_rate - placeholder).abs() < 1.0);
+
+        let t0 = Instant::now();
+        let mut rtt = RttEstimator::new(Duration::from_millis(333));
+        rtt.update(Duration::ZERO, Duration::from_millis(40));
+        bbr3.on_packet_sent(t0, 1200, 0, SpaceKind::Data);
+        let t1 = t0 + Duration::from_millis(40);
+        bbr3.on_ack(t1, t0, 1200, 0, SpaceKind::Data, false, &rtt);
+
+        let expected = STARTUP_PACING_GAIN * 12_000.0 / rtt.get().as_secs_f64();
+        assert!(
+            (bbr3.pacing_rate - expected).abs() / expected < 0.01,
+            "pacing_rate {} B/s, expected {} B/s (placeholder was {})",
+            bbr3.pacing_rate,
+            expected,
+            placeholder
+        );
     }
 
     /// A.1: Exiting STARTUP on a bandwidth plateau.
@@ -6991,6 +7029,84 @@ mod test {
             final_err < 0.10,
             "max_bw after subsequent probing ({max_bw_final}) should still be within 10% of the \
              simulated {BW} (rel err {final_err})"
+        );
+    }
+
+    /// An idle connection that only exchanges keepalives must not let those
+    /// tiny samples age `max_bw` out of the filter. The ack that clears the
+    /// previous app-limited marker has to re-mark the still-idle sender, or the
+    /// next keepalive sample is taken as a real bandwidth measurement.
+    #[test]
+    fn keepalives_while_idle_preserve_max_bw() {
+        const MSS: u64 = 1200;
+        const BW: f64 = 12_500_000.0;
+        const RTT_NS: u64 = 50_000_000;
+        const KEEPALIVE: u16 = 40;
+        const KEEPALIVE_INTERVAL_NS: u64 = 1_000_000_000;
+
+        let mut sim = Sim::new(Bbr3Config::default(), MSS, BW, RTT_NS);
+        let mut rounds_in_probe_bw = 0;
+        sim.run(
+            1_000_000,
+            |_| ControlFlow::Continue(()),
+            |bbr, _, _, _| {
+                if matches!(bbr.state, BbrState::ProbeBw(_)) {
+                    rounds_in_probe_bw += 1;
+                }
+                if rounds_in_probe_bw > 10_000 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        );
+        let max_bw_before = sim.bbr.max_bw;
+        assert!(max_bw_before > BW * 0.5, "warm-up max_bw {max_bw_before}");
+
+        // drain everything in flight, then go idle
+        let mut now_ns = sim.now_ns;
+        while let Some(p) = sim.flight.pop_front() {
+            now_ns = now_ns.max(p.ack_ns);
+            sim.inflight -= MSS;
+            let now_at = sim.at(now_ns);
+            sim.bbr.on_ack(
+                now_at,
+                sim.at(p.send_ns),
+                MSS,
+                p.pn,
+                SpaceKind::Data,
+                true,
+                &sim.rtt_est,
+            );
+            sim.bbr
+                .on_end_acks(now_at, sim.inflight, true, Some(p.pn), SpaceKind::Data);
+        }
+
+        let mut pn = sim.pn;
+        for _ in 0..300 {
+            now_ns += KEEPALIVE_INTERVAL_NS;
+            let sent = sim.at(now_ns);
+            sim.bbr.on_packet_sent(sent, KEEPALIVE, pn, SpaceKind::Data);
+            now_ns += RTT_NS;
+            let acked = sim.at(now_ns);
+            sim.bbr.on_ack(
+                acked,
+                sent,
+                KEEPALIVE as u64,
+                pn,
+                SpaceKind::Data,
+                true,
+                &sim.rtt_est,
+            );
+            sim.bbr
+                .on_end_acks(acked, 0, true, Some(pn), SpaceKind::Data);
+            pn += 1;
+        }
+
+        let max_bw_after = sim.bbr.max_bw;
+        assert!(
+            max_bw_after > max_bw_before * 0.5,
+            "max_bw collapsed from {max_bw_before} to {max_bw_after} after idle keepalives"
         );
     }
 }
