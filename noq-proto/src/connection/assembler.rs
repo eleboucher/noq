@@ -31,8 +31,10 @@ impl Assembler {
     pub(super) fn reinit(&mut self) {
         let old_data = mem::take(&mut self.data);
         *self = Self::default();
-        self.data = old_data;
-        self.data.clear();
+        if old_data.capacity() <= 32 {
+            self.data = old_data;
+            self.data.clear();
+        }
     }
 
     pub(super) fn is_ordered(&self) -> bool {
@@ -412,6 +414,32 @@ mod test {
 
     use super::*;
     use assert_matches::assert_matches;
+
+    #[test]
+    fn reinit_releases_large_buffer_queue() {
+        let mut assembler = Assembler::new();
+        for offset in 0..1024 {
+            assembler
+                .insert(offset, Bytes::from_static(b"x"), 1)
+                .unwrap();
+        }
+        let capacity = assembler.data.capacity();
+        assert!(capacity >= 1024);
+        assembler.reinit();
+        assert!(assembler.data.capacity() <= 32);
+        assembler.insert(0, Bytes::from_static(b"ok"), 2).unwrap();
+        assert_matches!(next(&mut assembler, 2), Some(ref data) if &data[..] == b"ok");
+    }
+
+    #[test]
+    fn reinit_reuses_small_buffer_queue() {
+        let mut assembler = Assembler::new();
+        assembler.insert(0, Bytes::from_static(b"x"), 1).unwrap();
+        let capacity = assembler.data.capacity();
+        assembler.reinit();
+        assert_eq!(assembler.data.capacity(), capacity);
+        assert!(assembler.data.is_empty());
+    }
 
     #[test]
     fn assemble_ordered() {
