@@ -791,6 +791,20 @@ mod test {
     }
 
     #[test]
+    fn in_order_frames_behind_one_lost_frame_are_not_rejected() {
+        // One lost frame at the head, then full-size frames in order: an ordinary
+        // loss on a busy stream, which must survive until the retransmit lands.
+        const FRAME_LEN: usize = 1200;
+
+        let mut x = Assembler::new();
+        let data = Bytes::from(vec![0; FRAME_LEN]);
+        for i in 1..=(4 * MAX_CHUNKS) as u64 {
+            x.insert(i * FRAME_LEN as u64, data.clone(), FRAME_LEN)
+                .expect("in-order data behind a single gap must not be rejected");
+        }
+    }
+
+    #[test]
     fn defrag_respects_max_chunks_at_rounding_boundary() {
         let mut x = Assembler::new();
         let data = Bytes::from(vec![0; MIN_RETAINED_CHUNK_SIZE]);
